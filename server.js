@@ -6,26 +6,36 @@ const dotenv = require('dotenv');
 // ⚡ Forcer override pour éviter conflit avec variable Windows
 dotenv.config({ override: true });
 
+// Gestionnaires d'erreurs globaux POUR RENDER
+process.on('uncaughtException', (error) => {
+  console.error('❌ Uncaught Exception:', error);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
 // Debug : afficher la clé lue
 console.log('STRIPE_SECRET_KEY raw:', process.env.STRIPE_SECRET_KEY ? '✓ Présente' : '✗ Manquante');
 console.log('Début de la clé:', process.env.STRIPE_SECRET_KEY?.substring(0, 20) + '...');
 console.log('Longueur:', process.env.STRIPE_SECRET_KEY?.length);
 
-// Vérification de la clé Stripe
+// Vérification de la clé Stripe - VERSION RENDER (ne pas quitter le processus)
+let stripe;
 if (!process.env.STRIPE_SECRET_KEY || !process.env.STRIPE_SECRET_KEY.startsWith('sk_')) {
-  console.error('❌ STRIPE_SECRET_KEY manquante ou incorrecte dans .env');
-  console.error('La clé doit commencer par "sk_"');
-  process.exit(1);
+  console.error('❌ STRIPE_SECRET_KEY manquante ou incorrecte');
+  console.log('⚠️  Le serveur démarre sans Stripe');
+} else {
+  stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+  console.log('✅ Stripe configuré');
 }
 
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000; // ← PORT 10000 pour Render
 
-// Configuration CORS
+// Configuration CORS - VERSION RENDER (autorise tout)
 app.use(cors({
-  origin: ['http://localhost:19006', 'http://192.168.1.81:19006', 'exp://192.168.1.81:19000'],
+  origin: '*',  // ← AUTORISE TOUTES LES ORIGINES
   methods: ['GET', 'POST'],
   credentials: true
 }));
@@ -76,6 +86,11 @@ app.post('/verify-promo', (req, res) => {
 // Endpoint pour créer un PaymentIntent
 app.post('/create-payment-intent', async (req, res) => {
   try {
+    // Vérifier si Stripe est configuré
+    if (!stripe) {
+      return res.status(500).json({ error: 'Stripe non configuré sur le serveur' });
+    }
+
     const { amount, currency = 'eur' } = req.body;
 
     if (!amount || amount <= 0) {
@@ -111,6 +126,10 @@ app.post('/create-payment-intent', async (req, res) => {
 // Endpoint de test Stripe
 app.get('/test-stripe', async (req, res) => {
   try {
+    if (!stripe) {
+      return res.status(500).json({ status: 'ERROR', error: 'Stripe non configuré' });
+    }
+    
     const balance = await stripe.balance.retrieve();
     res.json({ status: 'SUCCESS', message: 'Connexion Stripe OK', balance });
   } catch (error) {
@@ -123,21 +142,24 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'OK', 
     timestamp: new Date().toISOString(), 
-    stripe: process.env.STRIPE_SECRET_KEY ? 'Configured' : 'Missing',
+    stripe: !!stripe,
+    port: PORT,
+    environment: 'Render',
     routes: ['/health', '/test-stripe', '/create-payment-intent', '/verify-promo']
   });
 });
 
 app.get('/', (req, res) => res.json({ 
-  message: 'Serveur Stripe en ligne', 
+  message: 'Serveur Stripe MissOdora - Render', 
+  environment: 'Production',
   endpoints: ['/health', '/test-stripe', '/create-payment-intent', '/verify-promo'] 
 }));
 
-// Démarrer le serveur
+// Démarrer le serveur - VERSION RENDER
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📍 URL Local: http://localhost:${PORT}`);
-  console.log(`📍 URL Réseau: http://192.168.1.81:${PORT}`);
+  console.log(`📍 URL Render: https://missodora-backend-server.onrender.com`);
+  console.log(`📍 Health Check: https://missodora-backend-server.onrender.com/health`);
   console.log('📋 Routes disponibles:');
   console.log('   POST /verify-promo');
   console.log('   POST /create-payment-intent'); 
@@ -145,3 +167,5 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('   GET  /test-stripe');
   console.log('   GET  /');
 });
+
+console.log('✅ Serveur Render démarré avec succès');
