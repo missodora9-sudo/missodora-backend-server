@@ -3,16 +3,23 @@ const express = require('express');
 const cors = require('cors');
 const Stripe = require('stripe');
 const dotenv = require('dotenv');
+
 const {
   getApps,
   initializeApp,
   cert
 } = require('firebase-admin/app');
+
 const { getAuth } = require('firebase-admin/auth');
 const fs = require('fs');
 
-// ⚡ Configuration environnement
+// =====================================================
+// ⚡ CONFIGURATION ENVIRONNEMENT
+// =====================================================
+
 dotenv.config({ override: true });
+
+const PORT = process.env.PORT || 10000;
 
 // =====================================================
 // 🔐 FIREBASE ADMIN
@@ -26,7 +33,7 @@ if (getApps().length === 0) {
     const serviceAccount = require(firebaseKeyPath);
 
     initializeApp({
-      credential: cert(serviceAccount),
+      credential: cert(serviceAccount)
     });
 
     console.log('✅ Firebase Admin connecté avec succès');
@@ -34,10 +41,6 @@ if (getApps().length === 0) {
     console.error('❌ Fichier Firebase Admin introuvable sur Render');
   }
 }
-
-// =====================================================
-// 🔐 FIREBASE AUTHENTICATION ADMIN
-// =====================================================
 
 const adminAuth = getApps().length > 0 ? getAuth() : null;
 
@@ -64,7 +67,7 @@ process.on('unhandledRejection', (reason, promise) => {
 // =====================================================
 
 console.log(
-  'STRIPE_SECRET_KEY raw:',
+  'STRIPE_SECRET_KEY:',
   process.env.STRIPE_SECRET_KEY ? '✓ Présente' : '✗ Manquante'
 );
 
@@ -86,7 +89,6 @@ if (
 // =====================================================
 
 const app = express();
-const PORT = process.env.PORT || 10000;
 
 app.use(cors({
   origin: '*',
@@ -97,14 +99,56 @@ app.use(cors({
 app.use(express.json());
 
 // =====================================================
+// 🔐 PROTECTION DES ROUTES ADMINISTRATEUR
+// =====================================================
+
+const requireAdmin = async (req, res, next) => {
+  try {
+    if (!adminAuth) {
+      return res.status(503).json({
+        error: 'Firebase Authentication indisponible'
+      });
+    }
+
+    const authorization = req.headers.authorization || '';
+    const token = authorization.replace(/^Bearer\s+/i, '');
+
+    if (!token || token === authorization) {
+      return res.status(401).json({
+        error: 'Authentification requise'
+      });
+    }
+
+    const decodedToken = await adminAuth.verifyIdToken(token, true);
+
+    if (decodedToken.admin !== true) {
+      return res.status(403).json({
+        error: 'Accès administrateur refusé'
+      });
+    }
+
+    req.adminUid = decodedToken.uid;
+
+    next();
+
+  } catch (error) {
+    console.error('Erreur authentification admin:', error.message);
+
+    return res.status(401).json({
+      error: 'Jeton invalide ou expiré'
+    });
+  }
+};
+
+// =====================================================
 // 🎁 CODES PROMOTIONNELS
 // =====================================================
 
 const promoCodes = {
-  'PROMO10': 10,
-  'PROMO20': 20,
-  'BLACKFRIDAY': 50,
-  'SOSO70': 70
+  PROMO10: 10,
+  PROMO20: 20,
+  BLACKFRIDAY: 50,
+  SOSO70: 70
 };
 
 app.post('/verify-promo', (req, res) => {
@@ -121,10 +165,6 @@ app.post('/verify-promo', (req, res) => {
 
   const upperCode = code.toUpperCase().trim();
   const reduction = promoCodes[upperCode];
-
-  console.log(
-    `🔍 Recherche code: "${upperCode}", trouvé: ${reduction}%`
-  );
 
   if (reduction !== undefined) {
     return res.json({
@@ -154,7 +194,6 @@ app.post('/create-payment-intent', async (req, res) => {
     }
 
     const { amount, currency = 'eur' } = req.body;
-
     const amountInCents = Number(amount);
 
     if (
@@ -174,7 +213,7 @@ app.post('/create-payment-intent', async (req, res) => {
 
     const paymentIntent = await stripe.paymentIntents.create({
       amount: amountInCents,
-      currency: currency,
+      currency,
       automatic_payment_methods: {
         enabled: true
       },
@@ -188,11 +227,11 @@ app.post('/create-payment-intent', async (req, res) => {
       paymentIntentId: paymentIntent.id
     });
 
-  } catch (err) {
-    console.error('❌ Erreur Stripe:', err);
+  } catch (error) {
+    console.error('❌ Erreur Stripe:', error);
 
     return res.status(500).json({
-      error: err.message || 'Impossible de créer PaymentIntent'
+      error: error.message || 'Impossible de créer PaymentIntent'
     });
   }
 });
@@ -227,6 +266,129 @@ app.get('/test-stripe', async (req, res) => {
 });
 
 // =====================================================
+// 👑 ESPACE ADMINISTRATEUR
+// =====================================================
+
+// 📋 LISTE DES UTILISATEURS
+app.get('/admin/users', requireAdmin, async (req, res) => {
+  try {
+    const pageToken = req.query.pageToken || undefined;
+
+    const result = await adminAuth.listUsers(1000, pageToken);
+
+    const users = result.users.map(user => ({
+      uid: user.uid,
+      email: user.email || null,
+      displayName: user.displayName || null,
+      disabled: user.disabled,
+      emailVerified: user.emailVerified,
+      creationTime: user.metadata.creationTime,
+      lastSignInTime: user.metadata.lastSignInTime,
+      isAdmin: user.customClaims?.admin === true
+    }));
+
+    return res.json({
+      success: true,
+      users,
+      nextPageToken: result.pageToken || null
+    });
+
+  } catch (error) {
+    console.error('Erreur liste utilisateurs:', error);
+
+    return res.status(500).json({
+      error: 'Impossible de récupérer les utilisateurs'
+    });
+  }
+});
+
+// 🔒 BLOQUER UN COMPTE CLIENT
+app.post('/admin/users/:uid/block', requireAdmin, async (req, res) => {
+  try {
+    const uid = req.params.uid;
+
+    if (!uid || uid === req.adminUid) {
+      return res.status(400).json({
+        error: 'Action impossible sur ce compte'
+      });
+    }
+
+    const user = await adminAuth.getUser(uid);
+
+    if (user.customClaims?.admin === true) {
+      return res.status(403).json({
+        error: 'Action impossible sur un compte administrateur'
+      });
+    }
+
+    await adminAuth.updateUser(uid, {
+      disabled: true
+    });
+
+    await adminAuth.revokeRefreshTokens(uid);
+
+    console.log('🔒 Compte client bloqué:', uid);
+
+    return res.json({
+      success: true,
+      message: 'Compte bloqué avec succès',
+      uid
+    });
+
+  } catch (error) {
+    console.error('Erreur blocage utilisateur:', error);
+
+    return res.status(
+      error.code === 'auth/user-not-found' ? 404 : 500
+    ).json({
+      error: 'Impossible de bloquer ce compte'
+    });
+  }
+});
+
+// 🔓 DÉBLOQUER UN COMPTE CLIENT
+app.post('/admin/users/:uid/unblock', requireAdmin, async (req, res) => {
+  try {
+    const uid = req.params.uid;
+
+    if (!uid || uid === req.adminUid) {
+      return res.status(400).json({
+        error: 'Action impossible sur ce compte'
+      });
+    }
+
+    const user = await adminAuth.getUser(uid);
+
+    if (user.customClaims?.admin === true) {
+      return res.status(403).json({
+        error: 'Action impossible sur un compte administrateur'
+      });
+    }
+
+    await adminAuth.updateUser(uid, {
+      disabled: false
+    });
+
+    console.log('🔓 Compte client débloqué:', uid);
+
+    return res.json({
+      success: true,
+      message: 'Compte débloqué avec succès',
+      uid
+    });
+
+  } catch (error) {
+    console.error('Erreur déblocage utilisateur:', error);
+
+    return res.status(
+      error.code === 'auth/user-not-found' ? 404 : 500
+    ).json({
+      error: 'Impossible de débloquer ce compte'
+    });
+  }
+});
+
+// =====================================================
 // ❤️ SANTÉ DU SERVEUR
 // =====================================================
 
@@ -242,7 +404,10 @@ app.get('/health', (req, res) => {
       '/health',
       '/test-stripe',
       '/create-payment-intent',
-      '/verify-promo'
+      '/verify-promo',
+      '/admin/users',
+      '/admin/users/:uid/block',
+      '/admin/users/:uid/unblock'
     ]
   });
 });
@@ -259,7 +424,10 @@ app.get('/', (req, res) => {
       '/health',
       '/test-stripe',
       '/create-payment-intent',
-      '/verify-promo'
+      '/verify-promo',
+      '/admin/users',
+      '/admin/users/:uid/block',
+      '/admin/users/:uid/unblock'
     ]
   });
 });
@@ -270,9 +438,11 @@ app.get('/', (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server running on port ${PORT}`);
+
   console.log(
     '📍 URL Render: https://missodora-backend-server.onrender.com'
   );
+
   console.log(
     '📍 Health Check: https://missodora-backend-server.onrender.com/health'
   );
@@ -283,6 +453,9 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('   GET  /health');
   console.log('   GET  /test-stripe');
   console.log('   GET  /');
+  console.log('   GET  /admin/users');
+  console.log('   POST /admin/users/:uid/block');
+  console.log('   POST /admin/users/:uid/unblock');
 });
 
 console.log('✅ Serveur Render démarré avec succès');
