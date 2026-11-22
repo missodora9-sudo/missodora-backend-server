@@ -8,12 +8,17 @@
     "dev": "nodemon server.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
     "cors": "^2.8.5",
-    "stripe": "^14.0.0",
-    "dotenv": "^16.3.1"
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "firebase-admin": "^14.5.1",
+    "stripe": "^14.0.0"
   },
-  "keywords": ["backend", "stripe", "api"],
+  "keywords": [
+    "backend",
+    "stripe",
+    "api"
+  ],
   "author": "MissOdora",
   "license": "MIT"
 }

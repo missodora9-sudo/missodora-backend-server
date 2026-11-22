@@ -2,9 +2,28 @@ const express = require('express');
 const cors = require('cors');
 const Stripe = require('stripe');
 const dotenv = require('dotenv');
+const admin = require('firebase-admin');
+const fs = require('fs');
 
 // ⚡ Forcer override pour éviter conflit avec variable Windows
 dotenv.config({ override: true });
+
+// 🔐 Connexion Firebase Admin avec le fichier sécurisé de Render
+const firebaseKeyPath = '/etc/secrets/missodora-c1ced-firebase-adminsdk-fbsvc-6713db9fbe.json';
+
+if (!admin.apps.length) {
+  if (fs.existsSync(firebaseKeyPath)) {
+    const serviceAccount = require(firebaseKeyPath);
+
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+
+    console.log('✅ Firebase Admin connecté avec succès');
+  } else {
+    console.error('⚠️ Fichier Firebase Admin introuvable sur Render');
+  }
+}
 
 // Gestionnaires d'erreurs globaux POUR RENDER
 process.on('uncaughtException', (error) => {
@@ -17,8 +36,6 @@ process.on('unhandledRejection', (reason, promise) => {
 
 // Debug : afficher la clé lue
 console.log('STRIPE_SECRET_KEY raw:', process.env.STRIPE_SECRET_KEY ? '✓ Présente' : '✗ Manquante');
-console.log('Début de la clé:', process.env.STRIPE_SECRET_KEY?.substring(0, 20) + '...');
-console.log('Longueur:', process.env.STRIPE_SECRET_KEY?.length);
 
 // Vérification de la clé Stripe - VERSION RENDER (ne pas quitter le processus)
 let stripe;
