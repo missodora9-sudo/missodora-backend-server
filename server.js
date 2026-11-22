@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const Stripe = require('stripe');
 const dotenv = require('dotenv');
-const admin = require('firebase-admin');
+const { getApps, initializeApp, cert } = require('firebase-admin/app');
 const fs = require('fs');
 
 // ⚡ Forcer override pour éviter conflit avec variable Windows
@@ -11,12 +11,12 @@ dotenv.config({ override: true });
 // 🔐 Connexion Firebase Admin avec le fichier sécurisé de Render
 const firebaseKeyPath = '/etc/secrets/missodora-c1ced-firebase-adminsdk-fbsvc-6713db9fbe.json';
 
-if (!admin.apps.length) {
+if (getApps().length === 0) {
   if (fs.existsSync(firebaseKeyPath)) {
     const serviceAccount = require(firebaseKeyPath);
 
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
+    initializeApp({
+      credential: cert(serviceAccount),
     });
 
     console.log('✅ Firebase Admin connecté avec succès');
