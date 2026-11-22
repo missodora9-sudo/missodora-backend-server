@@ -41,8 +41,6 @@ if (getApps().length === 0) {
 
 const adminAuth = getApps().length > 0 ? getAuth() : null;
 
-const ADMIN_UID = 'RjXNXKxqjUfOdzeR5rD1pvFYLkL2';
-
 console.log(
   adminAuth
     ? '✅ Firebase Authentication Admin prêt'
@@ -97,74 +95,6 @@ app.use(cors({
 }));
 
 app.use(express.json());
-
-// =====================================================
-// 🔐 CONFIGURATION INITIALE ADMIN
-// ROUTE PROVISOIRE À SUPPRIMER APRÈS UTILISATION
-// =====================================================
-
-app.post('/admin/bootstrap', async (req, res) => {
-  try {
-    const secret = req.get('x-admin-bootstrap-secret');
-
-    if (
-      !process.env.ADMIN_BOOTSTRAP_SECRET ||
-      !secret ||
-      secret !== process.env.ADMIN_BOOTSTRAP_SECRET
-    ) {
-      return res.status(403).json({
-        success: false,
-        message: 'Accès interdit'
-      });
-    }
-
-    if (!adminAuth) {
-      return res.status(503).json({
-        success: false,
-        message: 'Firebase Admin indisponible'
-      });
-    }
-
-    const user = await adminAuth.getUser(ADMIN_UID);
-
-    if (
-      !user.email ||
-      user.email.toLowerCase() !== 'contact@missodora.com'
-    ) {
-      return res.status(403).json({
-        success: false,
-        message: 'Identité administrateur incorrecte'
-      });
-    }
-
-    if (user.customClaims?.admin === true) {
-      return res.json({
-        success: true,
-        message: 'Administrateur déjà configuré'
-      });
-    }
-
-    await adminAuth.setCustomUserClaims(ADMIN_UID, {
-      ...user.customClaims,
-      admin: true
-    });
-
-    console.log('✅ Rôle administrateur attribué');
-
-    return res.json({
-      success: true,
-      message: 'Administrateur MissOdora configuré'
-    });
-
-  } catch (error) {
-    console.error('❌ Erreur bootstrap admin:', error);
-
-    return res.status(500).json({
-      success: false,
-      message: 'Erreur lors de la configuration'
-    });
-  }
-});
 
 // =====================================================
 // 🎁 CODES PROMOTIONNELS
@@ -312,8 +242,7 @@ app.get('/health', (req, res) => {
       '/health',
       '/test-stripe',
       '/create-payment-intent',
-      '/verify-promo',
-      '/admin/bootstrap'
+      '/verify-promo'
     ]
   });
 });
@@ -353,7 +282,6 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('   POST /create-payment-intent');
   console.log('   GET  /health');
   console.log('   GET  /test-stripe');
-  console.log('   POST /admin/bootstrap');
   console.log('   GET  /');
 });
 
