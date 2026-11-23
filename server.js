@@ -3,6 +3,9 @@ const express = require('express');
 const cors = require('cors');
 const Stripe = require('stripe');
 const dotenv = require('dotenv');
+const nodemailer = require('nodemailer');
+const crypto = require('crypto');
+const { getFirestore } = require('firebase-admin/firestore');
 
 const {
   getApps,
@@ -43,6 +46,32 @@ if (getApps().length === 0) {
 }
 
 const adminAuth = getApps().length > 0 ? getAuth() : null;
+// =====================================================
+// 📧 FIRESTORE ET ENVOI DES EMAILS
+// =====================================================
+
+const db = getApps().length > 0 ? getFirestore() : null;
+
+const emailTransporter =
+  process.env.SMTP_HOST &&
+  process.env.SMTP_USER &&
+  process.env.SMTP_PASS
+    ? nodemailer.createTransport({
+        host: process.env.SMTP_HOST,
+        port: Number(process.env.SMTP_PORT || 465),
+        secure: process.env.SMTP_SECURE === 'true',
+        auth: {
+          user: process.env.SMTP_USER,
+          pass: process.env.SMTP_PASS
+        }
+      })
+    : null;
+
+console.log(
+  emailTransporter
+    ? '✅ Service e-mail OVH configuré'
+    : '❌ Service e-mail OVH indisponible'
+);
 
 console.log(
   adminAuth
@@ -98,9 +127,10 @@ app.use(cors({
 
 app.use(express.json());
 
-// =====================================================
-// 🔐 PROTECTION DES ROUTES ADMINISTRATEUR
-// =====================================================
+	
+ // =====================================================
+ // 🔐 PROTECTION DES ROUTES ADMINISTRATEUR
+ // =====================================================
 
 const requireAdmin = async (req, res, next) => {
   try {
@@ -128,7 +158,6 @@ const requireAdmin = async (req, res, next) => {
     }
 
     req.adminUid = decodedToken.uid;
-
     next();
 
   } catch (error) {
@@ -139,6 +168,284 @@ const requireAdmin = async (req, res, next) => {
     });
   }
 };
+
+
+// =====================================================
+// 🔐 PROTECTION DES ROUTES CLIENTS CONNECTÉS
+// =====================================================
+
+const requireUser = async (req, res, next) => {
+  try {
+    if (!adminAuth) {
+      return res.status(503).json({
+        error: 'Firebase Authentication indisponible'
+      });
+    }
+
+    const authorization = req.headers.authorization || '';
+    const token = authorization.replace(/^Bearer\s+/i, '');
+
+    if (!token || token === authorization) {
+      return res.status(401).json({
+        error: 'Authentification requise'
+      });
+    }
+
+    const decodedToken = await adminAuth.verifyIdToken(token, true);
+
+    req.uid = decodedToken.uid;
+    next();
+
+  } catch (error) {
+    console.error('Erreur authentification client:', error.message);
+
+    return res.status(401).json({
+      error: 'Authentification invalide'
+    });
+  }
+};
+
+
+// =====================================================
+// 📧 VÉRIFICATION DE L'ADRESSE E-MAIL DE CONTACT
+// =====================================================
+
+// ENVOYER UN CODE À L'ADRESSE DU PROFIL
+app.post('/profile/email-verification/request', requireUser, async (req, res) => {
+  try {
+    if (!db || !emailTransporter) {
+      return res.status(503).json({
+        error: 'Service e-mail temporairement indisponible'
+      });
+    }
+
+    const userRef = db.collection('users').doc(req.uid);
+    const userDoc = await userRef.get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({
+        error: 'Profil utilisateur introuvable'
+      });
+    }
+
+    const userData = userDoc.data();
+    const email = String(userData.email || '').trim().toLowerCase();
+
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({
+        error: 'Adresse e-mail de contact invalide'
+      });
+    }
+
+    if (
+      userData.emailContactVerified === true &&
+      String(userData.verifiedContactEmail || '').toLowerCase() === email
+    ) {
+      return res.json({
+        success: true,
+        alreadyVerified: true,
+        emailSentTo: email
+      });
+    }
+
+    const verificationRef = db
+      .collection('emailContactVerifications')
+      .doc(req.uid);
+
+    const previousDoc = await verificationRef.get();
+
+    if (previousDoc.exists) {
+      const previousData = previousDoc.data();
+
+      if (
+        previousData.lastSentAt &&
+        Date.now() - previousData.lastSentAt.toMillis() < 60 * 1000
+      ) {
+        return res.status(429).json({
+          error: 'Veuillez attendre une minute avant de demander un nouveau code.'
+        });
+      }
+    }
+
+    const code = crypto.randomInt(100000, 1000000).toString();
+    const codeHash = crypto
+      .createHash('sha256')
+      .update(code)
+      .digest('hex');
+
+    const now = Date.now();
+
+    await verificationRef.set({
+      email,
+      codeHash,
+      expiresAt: new Date(now + 10 * 60 * 1000),
+      lastSentAt: new Date(now),
+      attempts: 0
+    });
+
+    try {
+      await emailTransporter.sendMail({
+        from: `"MissOdora" <${process.env.SMTP_FROM || process.env.SMTP_USER}>`,
+        to: email,
+        subject: 'Votre code de vérification MissOdora',
+        text:
+          `Bonjour,\n\n` +
+          `Votre code de vérification MissOdora est : ${code}\n\n` +
+          `Ce code est valable pendant 10 minutes.\n\n` +
+          `Si vous n'avez pas demandé cette vérification, ignorez cet e-mail.\n\n` +
+          `L'équipe MissOdora`,
+        html: `
+          <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;padding:24px;color:#222">
+            <h2 style="color:#b08d45">MissOdora</h2>
+            <p>Bonjour,</p>
+            <p>Voici votre code de vérification :</p>
+            <div style="font-size:32px;font-weight:bold;letter-spacing:8px;padding:18px;background:#f7f3eb;text-align:center">
+              ${code}
+            </div>
+            <p>Ce code est valable pendant <strong>10 minutes</strong>.</p>
+            <p>Si vous n'avez pas demandé cette vérification, ignorez cet e-mail.</p>
+            <p>L'équipe MissOdora</p>
+          </div>
+        `
+      });
+    } catch (mailError) {
+      await verificationRef.delete();
+
+      console.error('Erreur envoi e-mail OVH:', mailError);
+
+      return res.status(502).json({
+        error: 'Impossible d’envoyer le code. Vérifiez votre adresse e-mail ou réessayez plus tard.'
+      });
+    }
+
+    console.log('📧 Code de vérification envoyé à :', email);
+
+    return res.json({
+      success: true,
+      emailSentTo: email
+    });
+
+  } catch (error) {
+    console.error('Erreur demande vérification e-mail:', error);
+
+    return res.status(500).json({
+      error: 'Erreur lors de la demande de vérification'
+    });
+  }
+});
+
+
+// CONFIRMER LE CODE REÇU
+app.post('/profile/email-verification/confirm', requireUser, async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(503).json({
+        error: 'Base de données indisponible'
+      });
+    }
+
+    const code = String(req.body.code || '').trim();
+
+    if (!/^\d{6}$/.test(code)) {
+      return res.status(400).json({
+        error: 'Veuillez saisir un code à 6 chiffres.'
+      });
+    }
+
+    const userRef = db.collection('users').doc(req.uid);
+    const verificationRef = db
+      .collection('emailContactVerifications')
+      .doc(req.uid);
+
+    const [userDoc, verificationDoc] = await Promise.all([
+      userRef.get(),
+      verificationRef.get()
+    ]);
+
+    if (!userDoc.exists || !verificationDoc.exists) {
+      return res.status(400).json({
+        error: 'Aucune demande de vérification en cours. Demandez un nouveau code.'
+      });
+    }
+
+    const userData = userDoc.data();
+    const verificationData = verificationDoc.data();
+
+    const currentEmail = String(userData.email || '').trim().toLowerCase();
+
+    // Le code ne doit plus fonctionner si l'adresse du profil a changé.
+    if (!currentEmail || currentEmail !== verificationData.email) {
+      await verificationRef.delete();
+
+      return res.status(400).json({
+        error: 'Votre adresse e-mail a changé. Demandez un nouveau code.'
+      });
+    }
+
+    if (verificationData.expiresAt.toMillis() < Date.now()) {
+      await verificationRef.delete();
+
+      return res.status(400).json({
+        error: 'Le code a expiré. Demandez un nouveau code.'
+      });
+    }
+
+    if ((verificationData.attempts || 0) >= 5) {
+      await verificationRef.delete();
+
+      return res.status(429).json({
+        error: 'Trop de tentatives. Demandez un nouveau code.'
+      });
+    }
+
+    const submittedHash = crypto
+      .createHash('sha256')
+      .update(code)
+      .digest('hex');
+
+    const expectedHash = verificationData.codeHash;
+
+    const submittedBuffer = Buffer.from(submittedHash, 'hex');
+    const expectedBuffer = Buffer.from(expectedHash, 'hex');
+
+    if (
+      submittedBuffer.length !== expectedBuffer.length ||
+      !crypto.timingSafeEqual(submittedBuffer, expectedBuffer)
+    ) {
+      await verificationRef.update({
+        attempts: (verificationData.attempts || 0) + 1
+      });
+
+      return res.status(400).json({
+        error: 'Code incorrect.'
+      });
+    }
+
+    await userRef.update({
+      emailContactVerified: true,
+      verifiedContactEmail: currentEmail,
+      emailContactVerifiedAt: new Date()
+    });
+
+    await verificationRef.delete();
+
+    console.log('✅ Adresse de contact vérifiée pour :', req.uid);
+
+    return res.json({
+      success: true,
+      verified: true,
+      emailVerified: currentEmail
+    });
+
+  } catch (error) {
+    console.error('Erreur confirmation e-mail:', error);
+
+    return res.status(500).json({
+      error: 'Impossible de confirmer le code.'
+    });
+  }
+});
+
 
 // =====================================================
 // 🎁 CODES PROMOTIONNELS
