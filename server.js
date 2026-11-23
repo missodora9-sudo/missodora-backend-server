@@ -598,23 +598,80 @@ app.get('/test-stripe', async (req, res) => {
 // 👑 ESPACE ADMINISTRATEUR
 // =====================================================
 
+
 // 📋 LISTE DES UTILISATEURS
 app.get('/admin/users', requireAdmin, async (req, res) => {
   try {
+    // Vérifier Firestore avant de récupérer les utilisateurs
+    if (!db) {
+      return res.status(503).json({
+        error: 'Base de données Firestore indisponible'
+      });
+    }
+
     const pageToken = req.query.pageToken || undefined;
 
     const result = await adminAuth.listUsers(1000, pageToken);
 
-    const users = result.users.map(user => ({
-      uid: user.uid,
-      email: user.email || null,
-      displayName: user.displayName || null,
-      disabled: user.disabled,
-      emailVerified: user.emailVerified,
-      creationTime: user.metadata.creationTime,
-      lastSignInTime: user.metadata.lastSignInTime,
-      isAdmin: user.customClaims?.admin === true
-    }));
+    // Récupérer également les profils Firestore
+    const users = await Promise.all(
+      result.users.map(async (user) => {
+        let profileData = {};
+
+        try {
+          const profileDoc = await db
+            .collection('users')
+            .doc(user.uid)
+            .get();
+
+          if (profileDoc.exists) {
+            profileData = profileDoc.data();
+          }
+        } catch (profileError) {
+          console.error(
+            'Erreur lecture profil Firestore:',
+            user.uid,
+            profileError.message
+          );
+        }
+
+       
+
+        const contactEmail = String(
+          profileData.email || ''
+        ).trim().toLowerCase();
+
+        const verifiedContactEmail = String(
+          profileData.verifiedContactEmail || ''
+        ).trim().toLowerCase();
+
+        return {
+          uid: user.uid,
+          email: user.email || null,
+          displayName: user.displayName || null,
+          disabled: user.disabled,
+
+          // Vérification de connexion Firebase
+          emailVerified: user.emailVerified,
+
+          // Vérification de l'adresse de contact par Brevo
+          emailContactVerified:
+            profileData.emailContactVerified === true &&
+            contactEmail !== '' &&
+            contactEmail === verifiedContactEmail,
+
+          contactEmail: profileData.email || null,
+          verifiedContactEmail:
+            profileData.verifiedContactEmail || null,
+          emailContactVerifiedAt:
+            profileData.emailContactVerifiedAt || null,
+
+          creationTime: user.metadata.creationTime,
+          lastSignInTime: user.metadata.lastSignInTime,
+          isAdmin: user.customClaims?.admin === true
+        };
+      })
+    );
 
     return res.json({
       success: true,
@@ -630,6 +687,7 @@ app.get('/admin/users', requireAdmin, async (req, res) => {
     });
   }
 });
+
 
 // 🔒 BLOQUER UN COMPTE CLIENT
 app.post('/admin/users/:uid/block', requireAdmin, async (req, res) => {
