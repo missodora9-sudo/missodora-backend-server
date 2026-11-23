@@ -3,7 +3,6 @@ const express = require('express');
 const cors = require('cors');
 const Stripe = require('stripe');
 const dotenv = require('dotenv');
-const nodemailer = require('nodemailer');
 const crypto = require('crypto');
 const { getFirestore } = require('firebase-admin/firestore');
 
@@ -52,26 +51,15 @@ const adminAuth = getApps().length > 0 ? getAuth() : null;
 
 const db = getApps().length > 0 ? getFirestore() : null;
 
-const emailTransporter =
-  process.env.SMTP_HOST &&
-  process.env.SMTP_USER &&
-  process.env.SMTP_PASS
-    ? nodemailer.createTransport({
-        host: process.env.SMTP_HOST,
-        port: Number(process.env.SMTP_PORT || 465),
-        secure: process.env.SMTP_SECURE === 'true',
-        auth: {
-          user: process.env.SMTP_USER,
-          pass: process.env.SMTP_PASS
-        }
-      })
-    : null;
+
+const brevoConfigured = !!process.env.BREVO_API_KEY;
 
 console.log(
-  emailTransporter
-    ? '✅ Service e-mail OVH configuré'
-    : '❌ Service e-mail OVH indisponible'
+  brevoConfigured
+    ? '✅ Service e-mail Brevo configuré'
+    : '❌ Clé API Brevo indisponible'
 );
+
 
 console.log(
   adminAuth
@@ -213,7 +201,7 @@ const requireUser = async (req, res, next) => {
 // ENVOYER UN CODE À L'ADRESSE DU PROFIL
 app.post('/profile/email-verification/request', requireUser, async (req, res) => {
   try {
-    if (!db || !emailTransporter) {
+    if (!db || !brevoConfigured) {
       return res.status(503).json({
         error: 'Service e-mail temporairement indisponible'
       });
@@ -283,18 +271,33 @@ app.post('/profile/email-verification/request', requireUser, async (req, res) =>
       attempts: 0
     });
 
-    try {
-      await emailTransporter.sendMail({
-        from: `"MissOdora" <${process.env.SMTP_FROM || process.env.SMTP_USER}>`,
-        to: email,
+    
+try {
+  const brevoResponse = await fetch(
+    'https://api.brevo.com/v3/smtp/email',
+    {
+      method: 'POST',
+      headers: {
+        'accept': 'application/json',
+        'api-key': process.env.BREVO_API_KEY,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        sender: {
+          name: process.env.BREVO_SENDER_NAME || 'MissOdora',
+          email: process.env.BREVO_SENDER_EMAIL || 'contact@missodora.com'
+        },
+        to: [
+          { email }
+        ],
         subject: 'Votre code de vérification MissOdora',
-        text:
+        textContent:
           `Bonjour,\n\n` +
           `Votre code de vérification MissOdora est : ${code}\n\n` +
           `Ce code est valable pendant 10 minutes.\n\n` +
           `Si vous n'avez pas demandé cette vérification, ignorez cet e-mail.\n\n` +
           `L'équipe MissOdora`,
-        html: `
+        htmlContent: `
           <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;padding:24px;color:#222">
             <h2 style="color:#b08d45">MissOdora</h2>
             <p>Bonjour,</p>
@@ -307,16 +310,35 @@ app.post('/profile/email-verification/request', requireUser, async (req, res) =>
             <p>L'équipe MissOdora</p>
           </div>
         `
-      });
-    } catch (mailError) {
-      await verificationRef.delete();
-
-      console.error('Erreur envoi e-mail OVH:', mailError);
-
-      return res.status(502).json({
-        error: 'Impossible d’envoyer le code. Vérifiez votre adresse e-mail ou réessayez plus tard.'
-      });
+      })
     }
+  );
+
+  if (!brevoResponse.ok) {
+    const errorBody = await brevoResponse.text();
+
+    console.error(
+      'Erreur API Brevo:',
+      brevoResponse.status,
+      errorBody
+    );
+
+    throw new Error('Échec de l’envoi via Brevo');
+  }
+
+} 
+  catch (mailError) {
+  await verificationRef.delete();
+
+  console.error('Erreur envoi e-mail Brevo:', mailError.message);
+
+  return res.status(502).json({
+    error: 'Impossible d’envoyer le code. Vérifiez votre adresse e-mail ou réessayez plus tard.'
+  });
+}
+
+	
+	
 
     console.log('📧 Code de vérification envoyé à :', email);
 
