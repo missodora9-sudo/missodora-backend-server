@@ -714,7 +714,9 @@ app.get('/health', (req, res) => {
       '/verify-promo',
       '/admin/users',
       '/admin/users/:uid/block',
-      '/admin/users/:uid/unblock'
+      '/admin/users/:uid/unblock',
+	  '/profile/email-verification/request',
+      '/profile/email-verification/confirm',
     ]
   });
 });
@@ -734,7 +736,9 @@ app.get('/', (req, res) => {
       '/verify-promo',
       '/admin/users',
       '/admin/users/:uid/block',
-      '/admin/users/:uid/unblock'
+      '/admin/users/:uid/unblock',
+	  '/profile/email-verification/request',
+      '/profile/email-verification/confirm',
     ]
   });
 });
