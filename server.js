@@ -3,7 +3,9 @@ const express = require('express');
 const cors = require('cors');
 const Stripe = require('stripe');
 const dotenv = require('dotenv');
+const fs = require('fs');
 const crypto = require('crypto');
+
 const { getFirestore } = require('firebase-admin/firestore');
 
 const {
@@ -13,7 +15,6 @@ const {
 } = require('firebase-admin/app');
 
 const { getAuth } = require('firebase-admin/auth');
-const fs = require('fs');
 
 // =====================================================
 // ⚡ CONFIGURATION ENVIRONNEMENT
@@ -21,36 +22,44 @@ const fs = require('fs');
 
 dotenv.config({ override: true });
 
-const PORT = process.env.PORT || 10000;
-
 // =====================================================
-// 🔐 FIREBASE ADMIN
+// 🔐 INITIALISATION UNIQUE FIREBASE ADMIN
 // =====================================================
 
 const firebaseKeyPath =
+  process.env.GOOGLE_APPLICATION_CREDENTIALS ||
   '/etc/secrets/missodora-c1ced-firebase-adminsdk-fbsvc-6713db9fbe.json';
 
-if (getApps().length === 0) {
-  if (fs.existsSync(firebaseKeyPath)) {
-    const serviceAccount = require(firebaseKeyPath);
+let db = null;
+let adminAuth = null;
 
-    initializeApp({
-      credential: cert(serviceAccount)
-    });
+try {
+  if (!fs.existsSync(firebaseKeyPath)) {
+    console.error('❌ Fichier Firebase Admin introuvable');
+  } else {
+    const serviceAccount = JSON.parse(
+      fs.readFileSync(firebaseKeyPath, 'utf8')
+    );
+
+    if (getApps().length === 0) {
+      initializeApp({
+        credential: cert(serviceAccount)
+      });
+    }
+
+    db = getFirestore();
+    adminAuth = getAuth();
 
     console.log('✅ Firebase Admin connecté avec succès');
-  } else {
-    console.error('❌ Fichier Firebase Admin introuvable sur Render');
+    console.log('✅ Firestore disponible');
+    console.log('✅ Firebase Authentication Admin prêt');
   }
+} catch (error) {
+  console.error(
+    '❌ Erreur initialisation Firebase Admin:',
+    error.message
+  );
 }
-
-const adminAuth = getApps().length > 0 ? getAuth() : null;
-// =====================================================
-// 📧 FIRESTORE ET ENVOI DES EMAILS
-// =====================================================
-
-const db = getApps().length > 0 ? getFirestore() : null;
-
 
 const brevoConfigured = !!process.env.BREVO_API_KEY;
 
@@ -60,12 +69,7 @@ console.log(
     : '❌ Clé API Brevo indisponible'
 );
 
-
-console.log(
-  adminAuth
-    ? '✅ Firebase Authentication Admin prêt'
-    : '❌ Firebase Authentication Admin indisponible'
-);
+const PORT = process.env.PORT || 10000;
 
 // =====================================================
 // ⚠️ GESTION DES ERREURS
@@ -514,15 +518,276 @@ app.post('/verify-promo', (req, res) => {
 // 💳 CRÉATION PAYMENT INTENT
 // =====================================================
 
-app.post('/create-payment-intent', async (req, res) => {
+
+// =====================================================
+// 💳 CRÉATION PAYMENT INTENT — CLIENT VÉRIFIÉ OBLIGATOIRE
+// =====================================================
+
+// Index produitsData pour le recalcul serveur (source de vérité des prix)
+const { produitsParMarque } = require('./data/produitsData');
+const ALL_PRODUCTS = Object.values(produitsParMarque).flat();
+const PRODUCT_BY_ID = new Map(ALL_PRODUCTS.map((p) => [String(p.id), p]));
+
+// Statuts autorisés pour le paiement
+const STATUTS_PAYABLES = ['en_attente', 'pending', 'en attente', 'non payé'];
+
+function estStatutPayable(statut) {
+  return STATUTS_PAYABLES.includes(String(statut || '').toLowerCase());
+}
+
+// Recalcul serveur du montant d'une commande.
+// Retourne { montantCents, detail } ou lève une erreur avec { status, code, message }.
+async function recalculerMontantCommande(commande) {
+  const articles = Array.isArray(commande.articles) ? commande.articles : [];
+  if (articles.length === 0) {
+    const e = new Error('Commande sans article');
+    e.status = 400; e.code = 'COMMANDE_VIDE';
+    throw e;
+  }
+
+  // Charger la vente flash active (si elle existe)
+  let flashSale = null;
+  try {
+    const flashSnap = await db.collection('flash_sales').doc('active_sale').get();
+    if (flashSnap.exists) flashSale = flashSnap.data();
+  } catch (_) {}
+
+  const flashActive =
+    flashSale &&
+    Number.isFinite(flashSale.endTimestamp) &&
+    flashSale.endTimestamp > Date.now() &&
+    Number(flashSale.stockLeft || 0) > 0 &&
+    Array.isArray(flashSale.produitsDetail);
+
+  const flashParProductId = new Map();
+  if (flashActive) {
+    for (const p of flashSale.produitsDetail) {
+      flashParProductId.set(String(p.productId), p);
+    }
+  }
+
+  let totalCents = 0;
+  const detail = [];
+
+  for (const article of articles) {
+    const productId = String(article.productId || article.id || '');
+    const quantite = Math.max(1, Number(article.quantite || article.quantity || 1));
+    const contenance = article.contenance || '100ml';
+
+    if (!productId) {
+      const e = new Error(`Article sans productId: ${JSON.stringify(article)}`);
+      e.status = 400; e.code = 'ARTICLE_INVALIDE';
+      throw e;
+    }
+
+    const prod = PRODUCT_BY_ID.get(productId);
+    if (!prod) {
+      const e = new Error(`Produit inconnu: ${productId}`);
+      e.status = 400; e.code = 'PRODUIT_INCONNU';
+      throw e;
+    }
+
+    // Prix de référence (catalogue officiel)
+    const prixNormal = Number(prod.prix);
+    if (!Number.isFinite(prixNormal) || prixNormal <= 0) {
+      const e = new Error(`Prix invalide pour ${productId}`);
+      e.status = 500; e.code = 'PRIX_INVALIDE';
+      throw e;
+    }
+
+    // Prix appliqué : flash si éligible, sinon normal
+    let prixUnitaire = prixNormal;
+    let source = 'normal';
+
+    const flash = flashParProductId.get(productId);
+    if (article.estVenteFlash === true && flash) {
+      const prixFlash = Number(flash.prixFlash);
+      if (Number.isFinite(prixFlash) && prixFlash > 0 && prixFlash < prixNormal) {
+        prixUnitaire = prixFlash;
+        source = 'flash';
+      }
+    }
+
+    const sousTotalCents = Math.round(prixUnitaire * quantite * 100);
+    totalCents += sousTotalCents;
+
+    detail.push({
+      productId,
+      nom: prod.nom,
+      contenance,
+      quantite,
+      prixNormal,
+      prixUnitaire,
+      source,
+      sousTotalCents,
+    });
+  }
+
+  // Appliquer la réduction promo (si la commande en a une)
+  const reduction = Number(commande.reductionAppliquee || 0);
+  if (Number.isFinite(reduction) && reduction > 0 && reduction < 100) {
+    totalCents = Math.round(totalCents * (1 - reduction / 100));
+  }
+
+  return { montantCents: totalCents, detail, reduction };
+}
+
+app.post('/create-payment-intent', requireUser, async (req, res) => {
   try {
     if (!stripe) {
-      return res.status(500).json({
+      return res.status(503).json({
         error: 'Stripe non configuré sur le serveur'
       });
     }
 
-    const { amount, currency = 'eur' } = req.body;
+    if (!db) {
+      return res.status(503).json({
+        error: 'Base de données indisponible'
+      });
+    }
+
+    // Vérifier le profil du client connecté
+    const userDoc = await db
+      .collection('users')
+      .doc(req.uid)
+      .get();
+
+    if (!userDoc.exists) {
+      return res.status(403).json({
+        error: 'Profil utilisateur introuvable. Veuillez vous reconnecter.'
+      });
+    }
+
+    const userData = userDoc.data();
+
+    const email = String(userData.email || '')
+      .trim()
+      .toLowerCase();
+
+    const verifiedEmail = String(userData.verifiedContactEmail || '')
+      .trim()
+      .toLowerCase();
+
+    // Vérification obligatoire de l'adresse de contact MissOdora
+    const emailVerified =
+      userData.emailContactVerified === true &&
+      email !== '' &&
+      email === verifiedEmail;
+
+    if (!emailVerified) {
+      return res.status(403).json({
+        error: 'EMAIL_NOT_VERIFIED',
+        message: 'Veuillez vérifier votre adresse e-mail de contact avant de procéder au paiement.'
+      });
+    }
+
+    const { commandeId, expectedAmount, amount, currency = 'eur' } = req.body;
+
+    // =====================================================
+    // MODE SÉCURISÉ : commandeId fourni → recalcul serveur
+    // =====================================================
+    if (commandeId) {
+      const commandeRef = db.collection('commandes').doc(String(commandeId));
+      const commandeSnap = await commandeRef.get();
+
+      if (!commandeSnap.exists) {
+        return res.status(404).json({
+          error: 'COMMANDE_INTROUVABLE',
+          message: 'Cette commande est introuvable.'
+        });
+      }
+
+      const commande = commandeSnap.data();
+
+      // La commande doit appartenir au client authentifié
+      if (String(commande.userId || '') !== req.uid) {
+        return res.status(403).json({
+          error: 'COMMANDE_NON_AUTORISEE',
+          message: 'Cette commande ne vous appartient pas.'
+        });
+      }
+
+      // La commande doit être payante (statut en attente)
+      if (!estStatutPayable(commande.statut)) {
+        return res.status(409).json({
+          error: 'COMMANDE_NON_PAYABLE',
+          message: `Cette commande n'est pas dans un état payable (statut: ${commande.statut || 'inconnu'}).`
+        });
+      }
+
+      // Déjà payée ?
+      if (commande.stripePaymentIntentId) {
+        return res.status(409).json({
+          error: 'COMMANDE_DEJA_PAYEE',
+          message: 'Cette commande a déjà été payée.',
+          paymentIntentId: commande.stripePaymentIntentId
+        });
+      }
+
+      // Recalcul serveur
+      let recalcul;
+      try {
+        recalcul = await recalculerMontantCommande(commande);
+      } catch (e) {
+        return res.status(e.status || 400).json({
+          error: e.code || 'RECALCUL_IMPOSSIBLE',
+          message: e.message
+        });
+      }
+
+      // Comparer avec le montant attendu côté client (si fourni)
+      const expected = Number(expectedAmount);
+      if (Number.isFinite(expected) && expected > 0) {
+        const ecart = Math.abs(recalcul.montantCents - expected);
+        if (ecart > 1) {
+          return res.status(409).json({
+            error: 'MONTANT_MODIFIE',
+            message: 'Le prix de votre commande a changé. Vérifiez le nouveau montant avant de payer.',
+            montantRecalcule: recalcul.montantCents,
+            montantAttendu: expected,
+            detail: recalcul.detail,
+            reduction: recalcul.reduction
+          });
+        }
+      }
+
+      console.log('💳 Création PaymentIntent autorisée (mode sécurisé):', {
+        uid: req.uid,
+        commandeId,
+        montantRecalcule: recalcul.montantCents,
+        montantEuros: (recalcul.montantCents / 100) + ' €',
+        articles: recalcul.detail.length
+      });
+
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: recalcul.montantCents,
+        currency,
+        automatic_payment_methods: { enabled: true },
+        metadata: {
+          uid: req.uid,
+          commandeId: String(commandeId),
+          integration_check: 'accept_a_payment'
+        }
+      });
+
+      // Marquer la commande comme liée au PaymentIntent (idempotence)
+      await commandeRef.update({
+        stripePaymentIntentId: paymentIntent.id,
+        montantRecalcule: recalcul.montantCents,
+        updatedAt: new Date()
+      });
+
+      return res.json({
+        clientSecret: paymentIntent.client_secret,
+        paymentIntentId: paymentIntent.id,
+        montantRecalcule: recalcul.montantCents
+      });
+    }
+
+    // =====================================================
+    // MODE LEGACY : amount fourni → comportement actuel
+    // (anciennes versions de l'app — à déprécier)
+    // =====================================================
     const amountInCents = Number(amount);
 
     if (
@@ -530,14 +795,13 @@ app.post('/create-payment-intent', async (req, res) => {
       amountInCents <= 0
     ) {
       return res.status(400).json({
-        error: 'Montant invalide'
+        error: 'Montant invalide ou commandeId manquant'
       });
     }
 
-    console.log('💳 Création PaymentIntent:', {
-      amountReçu: amount,
-      amountEnCents: amountInCents,
-      montantEnEuros: (amountInCents / 100) + ' €'
+    console.warn('⚠️ [LEGACY] Mode amount utilisé — à migrer vers commandeId', {
+      uid: req.uid,
+      amountEnCents: amountInCents
     });
 
     const paymentIntent = await stripe.paymentIntents.create({
@@ -547,6 +811,7 @@ app.post('/create-payment-intent', async (req, res) => {
         enabled: true
       },
       metadata: {
+        uid: req.uid,
         integration_check: 'accept_a_payment'
       }
     });
@@ -557,19 +822,20 @@ app.post('/create-payment-intent', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('❌ Erreur Stripe:', error);
+    console.error('❌ Erreur création PaymentIntent:', error);
 
     return res.status(500).json({
-      error: error.message || 'Impossible de créer PaymentIntent'
+      error: 'Impossible de créer le paiement'
     });
   }
 });
+
 
 // =====================================================
 // 💳 TEST STRIPE
 // =====================================================
 
-app.get('/test-stripe', async (req, res) => {
+app.get('/test-stripe', requireAdmin, async (req, res) => {
   try {
     if (!stripe) {
       return res.status(500).json({
