@@ -570,7 +570,8 @@ async function recalculerMontantCommande(commande) {
   const detail = [];
 
   for (const article of articles) {
-    const productId = String(article.productId || article.id || '');
+    const productIdBrut = String(article.productId || article.id || '').trim();
+    const productId = productIdBrut.replace(/-\d+ml$/i, '');
     const quantite = Math.max(1, Number(article.quantite || article.quantity || 1));
     const contenance = article.contenance || '100ml';
 
@@ -785,6 +786,14 @@ app.post('/create-payment-intent', requireUser, async (req, res) => {
     }
 
     // =====================================================
+    // SÉCURITÉ : interdire les paiements sans commandeId
+    if (!commandeId) {
+      return res.status(400).json({
+        error: 'COMMANDE_ID_REQUIRED',
+        message: 'Identifiant de commande obligatoire. Veuillez actualiser votre application.'
+      });
+    }
+
     // MODE LEGACY : amount fourni → comportement actuel
     // (anciennes versions de l'app — à déprécier)
     // =====================================================
