@@ -117,7 +117,149 @@ app.use(cors({
   credentials: true
 }));
 
+
+ // =====================================================
+ // STRIPE WEBHOOK — CONFIRMATION DES PAIEMENTS
+ // Cette route doit être AVANT express.json()
+ // =====================================================
+
+app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!stripe || !db || !process.env.STRIPE_WEBHOOK_SECRET) {
+    console.error('[STRIPE WEBHOOK] Configuration manquante');
+    return res.status(503).send('Webhook non configuré');
+  }
+
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      req.headers['stripe-signature'],
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (error) {
+    console.error('[STRIPE WEBHOOK] Signature invalide:', error.message);
+    return res.status(400).send('Signature Stripe invalide');
+  }
+
+  if (event.type !== 'payment_intent.succeeded') {
+    return res.status(200).json({ received: true, ignored: true });
+  }
+
+  const paymentIntent = event.data.object;
+
+  try {
+    const uid = String(paymentIntent.metadata?.uid || '');
+    const commandeId = String(paymentIntent.metadata?.commandeId || '');
+
+    if (!uid || !commandeId) {
+      console.error('[STRIPE WEBHOOK] Métadonnées manquantes');
+      return res.status(400).send('Métadonnées manquantes');
+    }
+
+    const commandeRef = db.collection('commandes').doc(commandeId);
+    const eventRef = db.collection('stripe_webhook_events').doc(event.id);
+
+    await db.runTransaction(async (transaction) => {
+      const eventSnap = await transaction.get(eventRef);
+
+      if (eventSnap.exists) return;
+
+      const commandeSnap = await transaction.get(commandeRef);
+
+      if (!commandeSnap.exists) {
+        transaction.create(eventRef, {
+          status: 'rejected',
+          reason: 'Commande introuvable',
+          createdAt: new Date()
+        });
+        return;
+      }
+
+      const commande = commandeSnap.data();
+
+      if (
+        String(commande.userId || '') !== uid ||
+        String(commande.stripePaymentIntentId || '') !== paymentIntent.id
+      ) {
+        transaction.create(eventRef, {
+          status: 'rejected',
+          reason: 'Propriétaire ou paiement incorrect',
+          commandeId,
+          createdAt: new Date()
+        });
+        return;
+      }
+
+      const montantAttendu = Number(commande.montantRecalcule);
+      const montantRecu = Number(paymentIntent.amount_received);
+
+      if (
+        !Number.isSafeInteger(montantAttendu) ||
+        montantAttendu <= 0 ||
+        montantRecu !== montantAttendu ||
+        paymentIntent.currency !== 'eur'
+      ) {
+        transaction.create(eventRef, {
+          status: 'rejected',
+          reason: 'Montant ou devise incorrect',
+          commandeId,
+          montantAttendu,
+          montantRecu,
+          createdAt: new Date()
+        });
+        return;
+      }
+
+      if (commande.statut === 'payée') {
+  transaction.create(eventRef, {
+    status: 'already_paid',
+    commandeId,
+    createdAt: new Date()
+  });
+  return;
+}
+
+if (!estStatutPayable(commande.statut)) {
+  transaction.create(eventRef, {
+    status: 'rejected',
+    reason: 'Commande non payable',
+    commandeId,
+    statut: commande.statut || null,
+    createdAt: new Date()
+  });
+  return;
+}
+
+      transaction.update(commandeRef, {
+        statut: 'payée',
+        datePaiement: new Date(),
+        stripePaymentStatus: 'succeeded',
+        updatedAt: new Date()
+      });
+
+      transaction.create(eventRef, {
+        status: 'processed',
+        type: event.type,
+        commandeId,
+        uid,
+        paymentIntentId: paymentIntent.id,
+        montantRecu,
+        createdAt: new Date()
+      });
+    });
+
+    return res.status(200).json({ received: true });
+
+  } catch (error) {
+    console.error('[STRIPE WEBHOOK] Erreur:', error);
+    return res.status(500).send('Erreur traitement webhook');
+  }
+});
+
+// Middleware JSON pour toutes les autres routes
 app.use(express.json());
+
 
 	
  // =====================================================
@@ -682,12 +824,34 @@ app.post('/create-payment-intent', requireUser, async (req, res) => {
       });
     }
 
-    const { commandeId, expectedAmount, amount, currency = 'eur' } = req.body;
+    const { commandeId, expectedAmount, codePromo } = req.body;
 
-    // =====================================================
-    // MODE SÉCURISÉ : commandeId fourni → recalcul serveur
-    // =====================================================
-    if (commandeId) {
+const codePromoNormalise =
+  typeof codePromo === 'string' ? codePromo.trim().toUpperCase() : '';
+
+const reductionPromo = codePromoNormalise
+  ? promoCodes[codePromoNormalise]
+  : 0;
+
+if (codePromoNormalise && reductionPromo === undefined) {
+  return res.status(400).json({
+    error: 'PROMO_INVALIDE',
+    message: 'Ce code promotionnel est invalide.'
+  });
+}
+
+if (!commandeId || typeof commandeId !== 'string' || !commandeId.trim()) {
+  return res.status(400).json({
+    error: 'COMMANDE_ID_REQUIRED',
+    message: 'Identifiant de commande obligatoire.'
+  });
+}
+
+// =====================================================
+// MODE SÉCURISÉ : recalcul serveur obligatoire
+// =====================================================
+
+if (commandeId) {
       const commandeRef = db.collection('commandes').doc(String(commandeId));
       const commandeSnap = await commandeRef.get();
 
@@ -728,7 +892,11 @@ app.post('/create-payment-intent', requireUser, async (req, res) => {
       // Recalcul serveur
       let recalcul;
       try {
-        recalcul = await recalculerMontantCommande(commande);
+        recalcul = await recalculerMontantCommande({
+  ...commande,
+  codePromo: codePromoNormalise || null,
+  reductionAppliquee: reductionPromo
+});
       } catch (e) {
         return res.status(e.status || 400).json({
           error: e.code || 'RECALCUL_IMPOSSIBLE',
@@ -762,7 +930,7 @@ app.post('/create-payment-intent', requireUser, async (req, res) => {
 
       const paymentIntent = await stripe.paymentIntents.create({
         amount: recalcul.montantCents,
-        currency,
+        currency: 'eur',
         automatic_payment_methods: { enabled: true },
         metadata: {
           uid: req.uid,
@@ -775,6 +943,8 @@ app.post('/create-payment-intent', requireUser, async (req, res) => {
       await commandeRef.update({
         stripePaymentIntentId: paymentIntent.id,
         montantRecalcule: recalcul.montantCents,
+		codePromo: codePromoNormalise || null,
+        reductionAppliquee: reductionPromo,
         updatedAt: new Date()
       });
 
@@ -785,50 +955,6 @@ app.post('/create-payment-intent', requireUser, async (req, res) => {
       });
     }
 
-    // =====================================================
-    // SÉCURITÉ : interdire les paiements sans commandeId
-    if (!commandeId) {
-      return res.status(400).json({
-        error: 'COMMANDE_ID_REQUIRED',
-        message: 'Identifiant de commande obligatoire. Veuillez actualiser votre application.'
-      });
-    }
-
-    // MODE LEGACY : amount fourni → comportement actuel
-    // (anciennes versions de l'app — à déprécier)
-    // =====================================================
-    const amountInCents = Number(amount);
-
-    if (
-      !Number.isSafeInteger(amountInCents) ||
-      amountInCents <= 0
-    ) {
-      return res.status(400).json({
-        error: 'Montant invalide ou commandeId manquant'
-      });
-    }
-
-    console.warn('⚠️ [LEGACY] Mode amount utilisé — à migrer vers commandeId', {
-      uid: req.uid,
-      amountEnCents: amountInCents
-    });
-
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: amountInCents,
-      currency,
-      automatic_payment_methods: {
-        enabled: true
-      },
-      metadata: {
-        uid: req.uid,
-        integration_check: 'accept_a_payment'
-      }
-    });
-
-    return res.json({
-      clientSecret: paymentIntent.client_secret,
-      paymentIntentId: paymentIntent.id
-    });
 
   } catch (error) {
     console.error('❌ Erreur création PaymentIntent:', error);
@@ -1066,6 +1192,7 @@ app.get('/health', (req, res) => {
       '/health',
       '/test-stripe',
       '/create-payment-intent',
+	  '/webhook/stripe',
       '/verify-promo',
       '/admin/users',
       '/admin/users/:uid/block',
@@ -1088,6 +1215,7 @@ app.get('/', (req, res) => {
       '/health',
       '/test-stripe',
       '/create-payment-intent',
+	  '/webhook/stripe',
       '/verify-promo',
       '/admin/users',
       '/admin/users/:uid/block',
