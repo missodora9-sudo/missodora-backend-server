@@ -825,6 +825,12 @@ app.post('/create-payment-intent', requireUser, async (req, res) => {
     }
 
     const { commandeId, expectedAmount, codePromo } = req.body;
+	console.log('📥 /create-payment-intent reçu:', {
+  uid: req.uid,
+  commandeId,
+  expectedAmount,
+  codePromo,
+});
 
 const codePromoNormalise =
   typeof codePromo === 'string' ? codePromo.trim().toUpperCase() : '';
@@ -832,6 +838,10 @@ const codePromoNormalise =
 const reductionPromo = codePromoNormalise
   ? promoCodes[codePromoNormalise]
   : 0;
+  console.log('🎁 Promo backend:', {
+  codePromoNormalise: codePromoNormalise || null,
+  reductionPromo,
+});
 
 if (codePromoNormalise && reductionPromo === undefined) {
   return res.status(400).json({
